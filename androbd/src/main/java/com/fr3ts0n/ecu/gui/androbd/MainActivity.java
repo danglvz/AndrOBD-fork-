@@ -28,8 +28,11 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ComponentName;
+import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.Drawable;
@@ -37,6 +40,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Message;
 import android.os.StrictMode;
 import android.preference.PreferenceManager;
@@ -66,7 +70,6 @@ import com.fr3ts0n.ecu.prot.obd.ElmProt;
 import com.fr3ts0n.ecu.prot.obd.ObdProt;
 import com.fr3ts0n.pvs.ProcessVar;
 import com.fr3ts0n.pvs.PvChangeEvent;
-import com.fr3ts0n.pvs.PvChangeListener;
 import com.fr3ts0n.pvs.PvList;
 
 import java.beans.PropertyChangeEvent;
@@ -92,9 +95,7 @@ import java.util.logging.SimpleFormatter;
  * Main Activity for AndrOBD app
  */
 public class MainActivity extends PluginManager
-        implements PvChangeListener,
-        AdapterView.OnItemLongClickListener,
-        PropertyChangeListener,
+        implements AdapterView.OnItemLongClickListener,
         SharedPreferences.OnSharedPreferenceChangeListener,
         AbsListView.MultiChoiceModeListener
 {
@@ -135,12 +136,12 @@ public class MainActivity extends PluginManager
     private static final String PREF_USE_LAST = "USE_LAST_SETTINGS";
     private static final String PREF_OVERLAY = "toolbar_overlay";
     private static final String PREF_DATA_DISABLE_MAX = "data_disable_max";
-    private static final int MESSAGE_FILE_WRITTEN = 3;
-    private static final int MESSAGE_DATA_ITEMS_CHANGED = 6;
-    private static final int MESSAGE_OBD_STATE_CHANGED = 8;
-    private static final int MESSAGE_OBD_NUMCODES = 9;
-    private static final int MESSAGE_OBD_ECUS = 10;
-    private static final int MESSAGE_OBD_NRC = 11;
+    public static final int MESSAGE_FILE_WRITTEN = 3;
+    public static final int MESSAGE_DATA_ITEMS_CHANGED = 6;
+    public static final int MESSAGE_OBD_STATE_CHANGED = 8;
+    public static final int MESSAGE_OBD_NUMCODES = 9;
+    public static final int MESSAGE_OBD_ECUS = 10;
+    public static final int MESSAGE_OBD_NRC = 11;
     private static final String TAG = "AndrOBD";
     /**
      * internal Intent request codes
@@ -207,12 +208,12 @@ public class MainActivity extends PluginManager
     /**
      * Data list adapters
      */
-    private static ObdItemAdapter mPidAdapter;
-    private static VidItemAdapter mVidAdapter;
-    private static TidItemAdapter mTidAdapter;
-    private static DfcItemAdapter mDfcAdapter;
-    private static PluginDataAdapter mPluginDataAdapter;
-    private static ObdItemAdapter currDataAdapter;
+    public static ObdItemAdapter mPidAdapter;
+    public static VidItemAdapter mVidAdapter;
+    public static TidItemAdapter mTidAdapter;
+    public static DfcItemAdapter mDfcAdapter;
+    public static PluginDataAdapter mPluginDataAdapter;
+    public static ObdItemAdapter currDataAdapter;
     /**
      * initial state of bluetooth adapter
      */
@@ -253,7 +254,7 @@ public class MainActivity extends PluginManager
     /**
      * Member object for the BT comm services
      */
-    private CommService mCommService = null;
+    //private CommService mCommService = null;
     /**
      * file helper
      */
@@ -306,7 +307,7 @@ public class MainActivity extends PluginManager
                         switch ((CommService.STATE) msg.obj)
                         {
                             case CONNECTED:
-                                onConnect();
+                                onConnect(!WorkerService.isRunning);
                                 break;
 
                             case CONNECTING:
@@ -324,13 +325,24 @@ public class MainActivity extends PluginManager
 
                     // data has been read - finish up
                     case MESSAGE_FILE_READ:
-                        // set listeners for data structure changes
-                        setDataListeners();
                         // set adapters data source to loaded list instances
                         mPidAdapter.setPvList(ObdProt.PidPvs);
                         mVidAdapter.setPvList(ObdProt.VidPvs);
                         mTidAdapter.setPvList(ObdProt.VidPvs);
                         mDfcAdapter.setPvList(ObdProt.tCodes);
+
+                        mWorkerServiceConnectionPendingTask = () -> {
+                            mWorkerServiceBinder.connectToFile();
+                        };
+
+                        if (!mIsWorkerServiceBound) {
+                            startOrBindWorkerService();
+                        }
+                        else {
+                            mWorkerServiceConnectionPendingTask.func();
+                            mWorkerServiceConnectionPendingTask = null;
+                        }
+
                         // set OBD data mode to the one selected by input file
                         setObdService(CommService.elm.getService(), getString(R.string.saved_data));
                         // Check if last data selection shall be restored
@@ -350,6 +362,8 @@ public class MainActivity extends PluginManager
                         break;
 
                     case MESSAGE_TOAST:
+                        stopWorkerService();
+
                         Toast.makeText(getApplicationContext(),
                                 msg.getData().getString(TOAST),
                                 Toast.LENGTH_SHORT).show();
@@ -360,7 +374,6 @@ public class MainActivity extends PluginManager
                         switch (event.getType())
                         {
                             case PvChangeEvent.PV_ADDED:
-                                currDataAdapter.setPvList(currDataAdapter.pvs);
                                 try
                                 {
                                     if (event.getSource() == ObdProt.PidPvs)
@@ -487,6 +500,74 @@ public class MainActivity extends PluginManager
         }
     };
 
+    private WorkerService.WorkerServiceBinder mWorkerServiceBinder = null;
+    private boolean mIsWorkerServiceBound = false;
+    private boolean mIsWorkerServiceStarted = WorkerService.isRunning;
+
+    interface WorkerServiceConnectionTask {
+        void func();
+    }
+
+    private WorkerServiceConnectionTask mWorkerServiceConnectionPendingTask = null;
+
+    private final ServiceConnection mWorkerServiceConnection = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            mWorkerServiceBinder = (WorkerService.WorkerServiceBinder) service;
+            mWorkerServiceBinder.setHandler(mHandler);
+            mWorkerServiceBinder.sendSavedDataToHandler();
+
+            if (mWorkerServiceConnectionPendingTask != null)
+            {
+                mWorkerServiceConnectionPendingTask.func();
+                mWorkerServiceConnectionPendingTask = null;
+            }
+
+            mIsWorkerServiceBound = true;
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            unbindWorkerService();
+        }
+    };
+
+    private void bindWorkerService() {
+        Intent intent = new Intent(getApplicationContext(), WorkerService.class);
+        bindService(intent, mWorkerServiceConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    private void unbindWorkerService() {
+        mWorkerServiceBinder.removeHandler();
+        mWorkerServiceBinder = null;
+        mIsWorkerServiceBound = false;
+        unbindService(mWorkerServiceConnection);
+    }
+
+    private void startOrBindWorkerService() {
+        if (!mIsWorkerServiceStarted) {
+            Intent intent = new Intent(getApplicationContext(), WorkerService.class);
+            startService(intent);
+            mIsWorkerServiceStarted = true;
+        }
+
+        if (!mIsWorkerServiceBound) {
+            bindWorkerService();
+        }
+    }
+
+    private void stopWorkerService() {
+        if (mIsWorkerServiceStarted) {
+            if (mIsWorkerServiceBound) {
+                unbindWorkerService();
+            }
+
+            Intent intent = new Intent(this, WorkerService.class);
+            stopService(intent);
+            mIsWorkerServiceStarted = false;
+        }
+    }
+
     /**
      * Set fixed PIDs for protocol to specified list of PIDs
      *
@@ -566,11 +647,6 @@ public class MainActivity extends PluginManager
 
         // create file helper instance
         fileHelper = new FileHelper(this);
-        // set listeners for data structure changes
-        setDataListeners();
-        // automate elm status display
-        CommService.elm.addPropertyChangeListener(this);
-
         // set up action bar
         ActionBar actionBar = getActionBar();
         if (actionBar != null)
@@ -587,6 +663,10 @@ public class MainActivity extends PluginManager
         if ("android.hardware.usb.action.USB_DEVICE_ATTACHED".equals(getIntent().getAction()))
         {
             CommService.medium = CommService.MEDIUM.USB;
+        }
+
+        if (mIsWorkerServiceStarted){
+            bindWorkerService();
         }
 
         switch (CommService.medium)
@@ -682,30 +762,11 @@ public class MainActivity extends PluginManager
         // Stop toolbar hider thread
         setAutoHider(false);
 
-        try
-        {
-            // Reduce ELM power consumption by setting it to sleep
-            CommService.elm.goToSleep();
-            // wait until message is out ...
-            Thread.sleep(100, 0);
-        } catch (InterruptedException e)
-        {
-            // do nothing
-            log.log(Level.FINER, e.getLocalizedMessage());
-        }
-
-        /* don't listen to ELM data changes any more */
-        removeDataListeners();
-        // don't listen to ELM property changes any more
-        CommService.elm.removePropertyChangeListener(this);
-
         // stop demo service if it was started
         setMode(MODE.OFFLINE);
 
-        // stop communication service
-        if (mCommService != null)
-        {
-            mCommService.stop();
+        if (mIsWorkerServiceBound) {
+            unbindWorkerService();
         }
 
         // if bluetooth adapter was switched OFF before ...
@@ -819,10 +880,8 @@ public class MainActivity extends PluginManager
 
             case R.id.disconnect:
                 // stop communication service
-                if (mCommService != null)
-                {
-                    mCommService.stop();
-                }
+                stopWorkerService();
+
                 setMode(MODE.OFFLINE);
                 return true;
 
@@ -874,6 +933,7 @@ public class MainActivity extends PluginManager
                 setObdService(ObdProt.OBD_SVC_READ_CODES, item.getTitle());
                 return true;
         }
+
 
         return super.onOptionsItemSelected(item);
     }
@@ -963,8 +1023,11 @@ public class MainActivity extends PluginManager
                 // DeviceListActivity returns with a device to connect
                 if (resultCode == Activity.RESULT_OK)
                 {
-                    mCommService = new UsbCommService(this, mHandler);
-                    mCommService.connect(UsbDeviceListActivity.selectedPort, true);
+                    mWorkerServiceConnectionPendingTask = () -> {
+                        mWorkerServiceBinder.connectToUsb();
+                    };
+
+                    startOrBindWorkerService();
                 } else
                 {
                     setMode(MODE.OFFLINE);
@@ -1293,25 +1356,6 @@ public class MainActivity extends PluginManager
     }
 
     /**
-     * Handler for PV change events This handler just forwards the PV change
-     * events to the android handler, since all adapter / GUI actions have to be
-     * performed from the main handler
-     *
-     * @param event PvChangeEvent which is reported
-     */
-    @Override
-    public synchronized void pvChanged(PvChangeEvent event)
-    {
-        // forward PV change to the UI Activity
-        Message msg = mHandler.obtainMessage(MainActivity.MESSAGE_DATA_ITEMS_CHANGED);
-        if (!event.isChildEvent())
-        {
-            msg.obj = event;
-            mHandler.sendMessage(msg);
-        }
-    }
-
-    /**
      * Check if restore of specified preselection is wanted from settings
      *
      * @param preselect specified preselect
@@ -1320,6 +1364,7 @@ public class MainActivity extends PluginManager
     private boolean istRestoreWanted(PRESELECT preselect)
     {
         return prefs.getStringSet(PREF_USE_LAST, emptyStringSet).contains(preselect.toString());
+        //return prefs.contains(preselect.toString());
     }
 
     /**
@@ -1597,47 +1642,19 @@ public class MainActivity extends PluginManager
     }
 
     /**
-     * set listeners for data structure changes
-     */
-    private void setDataListeners()
-    {
-        // add pv change listeners to trigger model updates
-        ObdProt.PidPvs.addPvChangeListener(this,
-                PvChangeEvent.PV_ADDED
-                        | PvChangeEvent.PV_CLEARED
-        );
-        ObdProt.VidPvs.addPvChangeListener(this,
-                PvChangeEvent.PV_ADDED
-                        | PvChangeEvent.PV_CLEARED
-        );
-        ObdProt.tCodes.addPvChangeListener(this,
-                PvChangeEvent.PV_ADDED
-                        | PvChangeEvent.PV_CLEARED
-        );
-        mPluginPvs.addPvChangeListener(this,
-                PvChangeEvent.PV_ADDED
-                        | PvChangeEvent.PV_CLEARED
-        );
-    }
-
-    /**
-     * set listeners for data structure changes
-     */
-    private void removeDataListeners()
-    {
-        // remove pv change listeners
-        ObdProt.PidPvs.removePvChangeListener(this);
-        ObdProt.VidPvs.removePvChangeListener(this);
-        ObdProt.tCodes.removePvChangeListener(this);
-        mPluginPvs.removePvChangeListener(this);
-    }
-
-    /**
      * get current operating mode
      */
     private MODE getMode()
     {
         return mode;
+    }
+
+    private void startBtDeviceListActivity() {
+        Intent serverIntent = new Intent(this, BtDeviceListActivity.class);
+        startActivityForResult(serverIntent,
+                prefs.getBoolean("bt_secure_connection", false)
+                        ? REQUEST_CONNECT_DEVICE_SECURE
+                        : REQUEST_CONNECT_DEVICE_INSECURE);
     }
 
     /**
@@ -1687,11 +1704,7 @@ public class MainActivity extends PluginManager
                                 } else
                                 {
                                     // ... otherwise launch the BtDeviceListActivity to see devices and do scan
-                                    Intent serverIntent = new Intent(this, BtDeviceListActivity.class);
-                                    startActivityForResult(serverIntent,
-                                            prefs.getBoolean("bt_secure_connection", false)
-                                                    ? REQUEST_CONNECT_DEVICE_SECURE
-                                                    : REQUEST_CONNECT_DEVICE_INSECURE);
+                                    startBtDeviceListActivity();
                                 }
                             }
                             break;
@@ -1952,11 +1965,12 @@ public class MainActivity extends PluginManager
      */
     private void connectBtDevice(String address, boolean secure)
     {
-        // Get the BluetoothDevice object
-        BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(address);
-        // Attempt to connect to the device
-        mCommService = new BtCommService(this, mHandler);
-        mCommService.connect(device, secure);
+        mWorkerServiceConnectionPendingTask = () -> {
+            BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(address);
+            mWorkerServiceBinder.connectToBluetooth(device, secure);
+        };
+
+        startOrBindWorkerService();
     }
 
     /**
@@ -1967,9 +1981,11 @@ public class MainActivity extends PluginManager
      */
     private void connectNetworkDevice(String address, int port)
     {
-        // Attempt to connect to the device
-        mCommService = new NetworkCommService(this, mHandler);
-        ((NetworkCommService) mCommService).connect(address, port);
+        mWorkerServiceConnectionPendingTask = () -> {
+            mWorkerServiceBinder.connectToNetwork(address, port);
+        };
+
+        startOrBindWorkerService();
     }
 
     /**
@@ -2167,7 +2183,7 @@ public class MainActivity extends PluginManager
      * Handle bluetooth connection established ...
      */
     @SuppressLint("StringFormatInvalid")
-    private void onConnect()
+    private void onConnect(boolean elmRestartRequired)
     {
         stopDemoService();
 
@@ -2180,7 +2196,9 @@ public class MainActivity extends PluginManager
         // display connection status
         setStatus(getString(R.string.title_connected_to, mConnectedDeviceName));
         // send RESET to Elm adapter
-        CommService.elm.reset();
+        if (elmRestartRequired) {
+            CommService.elm.reset();
+        }
     }
 
     /**
@@ -2190,50 +2208,6 @@ public class MainActivity extends PluginManager
     {
         // handle further initialisations
         setMode(MODE.OFFLINE);
-    }
-
-    /**
-     * Property change listener to ELM-Protocol
-     *
-     * @param evt the property change event to be handled
-     */
-    public void propertyChange(PropertyChangeEvent evt)
-    {
-        /* handle protocol status changes */
-        if (ElmProt.PROP_STATUS.equals(evt.getPropertyName()))
-        {
-            // forward property change to the UI Activity
-            Message msg = mHandler.obtainMessage(MESSAGE_OBD_STATE_CHANGED);
-            msg.obj = evt;
-            mHandler.sendMessage(msg);
-        } else
-        {
-            if (ElmProt.PROP_NUM_CODES.equals(evt.getPropertyName()))
-            {
-                // forward property change to the UI Activity
-                Message msg = mHandler.obtainMessage(MESSAGE_OBD_NUMCODES);
-                msg.obj = evt;
-                mHandler.sendMessage(msg);
-            } else
-            {
-                if (ElmProt.PROP_ECU_ADDRESS.equals(evt.getPropertyName()))
-                {
-                    // forward property change to the UI Activity
-                    Message msg = mHandler.obtainMessage(MESSAGE_OBD_ECUS);
-                    msg.obj = evt;
-                    mHandler.sendMessage(msg);
-                } else
-                {
-                    if (ObdProt.PROP_NRC.equals(evt.getPropertyName()))
-                    {
-                        // forward property change to the UI Activity
-                        Message msg = mHandler.obtainMessage(MESSAGE_OBD_NRC);
-                        msg.obj = evt;
-                        mHandler.sendMessage(msg);
-                    }
-                }
-            }
-        }
     }
 
     /**
